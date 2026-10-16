@@ -19,11 +19,18 @@ import os
 import httpx
 from openai import OpenAI
 from pydantic import BaseModel, Field
+from anthropic import Anthropic
+import traceback
 
 from explaining_markets.config import openai_model
 
+print("predict.py LOADED", flush=True)
+
 _openai: OpenAI | None = None  # lazy: importing this file must not require a key
 _openai_warned = False         # one-shot warning when no key is configured
+_claude_warned = False
+_claude: Anthropic | None = None
+CLAUDE_MODEL = "claude-sonnet-5-5"
 
 # Timeouts, sized against the 5-minute prediction window that opens when your
 # handler ACKs the webhook. Worst case is 15 + (120 x 2) + 15 = 270s, which
@@ -53,25 +60,41 @@ def predict(event: dict) -> list[dict]:
     0.50 = median, 1 = its most positive. It's a cross-sectional rank across the
     quarter's events, not a percentile within the asset's own history.
     """
-    summary = httpx.get(event["information_url"], timeout=SUMMARY_TIMEOUT_SECONDS)
-    summary.raise_for_status()
-    summary_json = summary.json()
+    print("PREDICT STARTED", flush=True)
+    try:
+        try:
+            summary = httpx.get(event["information_url"], timeout=SUMMARY_TIMEOUT_SECONDS)
+            summary.raise_for_status()
+            summary_json = summary.json()
+        except httpx.ConnectError:
+            if not str(event.get("event_id", "")).startswith("test_"):
+                raise  # never fake data for real events
+            print("[TEST] information_url unreachable, using fake summary", flush=True)
+            summary_json = {"summary": (
+                "Company X reported revenue of $5.2B vs $4.8B expected and EPS of "
+                "$1.40 vs $1.10 expected. Management raised full-year guidance by 8%."
+            )}
 
-    # One model call per focal asset, in series — so the LLM budget below is
-    # per asset, not per event. Today every event carries a single asset; if
-    # that changes and you need several, run them concurrently rather than
-    # raising the timeout.
-    return [
-        {
-            "identifier_value": asset["identifier_value"],
-            "predicted_percentile": _ask_llm(
-                summary=summary_json,
-                ticker=asset["identifier_value"],
-                event_type=event["event_type"],
-            ),
-        }
-        for asset in event["focal_assets"]
-    ]
+        # One model call per focal asset, in series — so the LLM budget below is
+        # per asset, not per event. Today every event carries a single asset; if
+        # that changes and you need several, run them concurrently rather than
+        # raising the timeout.
+        return [
+            {
+                "identifier_value": asset["identifier_value"],
+                "predicted_percentile": _ask_claude(
+                    summary=summary_json,
+                    ticker=asset["identifier_value"],
+                    event_type=event["event_type"],
+                ),
+            }
+            for asset in event["focal_assets"]
+        ]
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
 
 
 # ----------------------------------------------------------------------
@@ -164,3 +187,43 @@ def _ask_llm(*, summary: dict, ticker: str, event_type: str) -> float:
     if parsed is None:
         return 0.5  # model refused; competition expects a number
     return parsed.predicted_percentile
+
+def _ask_claude(*, summary: dict, ticker: str, event_type: str) -> float:
+    global _claude, _claude_warned
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        if not _claude_warned:
+            print("[WARN] ANTHROPIC_API_KEY not set — submitting 0.5 placeholder.")
+            _claude_warned = True
+        return 0.5
+    if _claude is None:
+        _claude = Anthropic(timeout=LLM_TIMEOUT_SECONDS, max_retries=LLM_MAX_RETRIES)
+
+    summary_text = summary.get("summary") if isinstance(summary, dict) else None
+    if not summary_text:
+        summary_text = json.dumps(summary)
+    summary_text = summary_text[:8000]
+
+    user_prompt = (
+        f"Event type: {event_type}\n"
+        f"Ticker: {ticker}\n\n"
+        f"Event summary:\n{summary_text}\n\n"
+        "Weigh, in roughly this order:\n"
+        "  1. Quantitative surprise vs expectations — revenue, EPS, segment metrics.\n"
+        "  2. Guidance / outlook — raises, holds, cuts vs the prior trajectory.\n"
+        "  3. Strategic shifts — product launches, M&A, capital allocation, leadership.\n"
+        "  4. Tone and confidence in management commentary (small weight).\n"
+        "  5. Risks called out — regulatory, supply chain, demand, competition.\n\n"
+        f"Predict the next-day unexpected-return percentile for {ticker}."
+    )
+
+    resp = _claude.messages.parse(
+        model=CLAUDE_MODEL,
+        max_tokens=200,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt}],
+        output_format=Prediction,
+    )
+    parsed = resp.parsed_output
+    if parsed is None:
+        return 0.5
+    return min(1.0, max(0.0, parsed.predicted_percentile))

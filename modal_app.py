@@ -42,7 +42,7 @@ app = modal.App("explaining-markets-starter")
 
 image = (
     modal.Image.debian_slim()
-    .pip_install("fastapi[standard]", "httpx", "openai", "pydantic")
+    .pip_install("fastapi[standard]", "httpx", "openai", "pydantic", "anthropic")
     .add_local_python_source("explaining_markets", "predict")
 )
 
@@ -113,7 +113,7 @@ def predict_and_submit(event: dict, webhook_id: str | None = None):
 
     submitted = False
     try:
-        predictions = neutral_predictions(event) if is_test(event) else predict(event)
+        predictions = predict(event)
         submit_predictions(
             event_id=event["event_id"],
             predictions=predictions,
